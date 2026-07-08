@@ -56,7 +56,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "8164490986:AAHZZKdkYr58TkLZS34shZpU7II5tWpxH
 # Telegram ID менеджера — сюда придут все заявки и вопросы клиентов.
 # Узнать свой ID можно у бота @userinfobot. Перед запуском менеджер должен
 # сам написать вашему боту /start, иначе бот не сможет написать ему первым.
-MANAGER_CHAT_ID = int(os.getenv("MANAGER_CHAT_ID", "7521801228"))
+MANAGER_CHAT_ID = int(os.getenv("MANAGER_CHAT_ID", "1116173212"))
 
 # Адрес вашей CRM
 CRM_BASE_URL = os.getenv("CRM_BASE_URL", "https://nexus-crm-production-a018.up.railway.app")
