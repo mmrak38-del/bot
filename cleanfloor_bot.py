@@ -18,6 +18,7 @@ Telegram-бот CleanFloor (Светлогорск) — один файл.
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -70,6 +71,15 @@ CRM_API_TOKEN = os.getenv("CRM_API_TOKEN", "cfcrm_xpEwkrOaqr5iXQgDh5yS60UXHq5s8X
 # падать в неё — посмотрите её ID в разделе "Воронки" (например через
 # вкладку Network в браузере при создании лида вручную) и поменяйте число.
 CRM_PIPELINE_ID = int(os.getenv("CRM_PIPELINE_ID", "1"))
+
+# Как часто (в секундах) бот опрашивает CRM в поисках новых заявок,
+# пришедших НЕ из бота (например с сайта). Это гарантирует, что менеджер
+# получит уведомление о любой заявке в CRM, независимо от источника.
+CRM_POLL_INTERVAL = int(os.getenv("CRM_POLL_INTERVAL", "20"))
+
+# Файл, в котором бот запоминает ID уже обработанных лидов CRM, чтобы
+# при перезапуске не разослать уведомления повторно и не пропустить новые.
+SEEN_LEADS_FILE = os.getenv("SEEN_LEADS_FILE", "seen_leads.json")
 
 # =============================================================================
 
@@ -129,7 +139,13 @@ class CRMClient:
         telegram: str | None = None,
         client_type: str = "физ",
         comment: str | None = None,
-    ) -> bool:
+    ) -> tuple[bool, int | None]:
+        """Создаёт лид в CRM.
+
+        Возвращает (успех, id_лида). id_лида используется, чтобы сразу
+        пометить лид как "уже уведомили" и не продублировать уведомление
+        фоновым опросом CRM (см. poll_new_leads ниже).
+        """
         url = f"{self.base_url}/leads"
         payload = {
             "name": name,
@@ -152,16 +168,155 @@ class CRMClient:
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
                     if resp.status in (200, 201):
-                        return True
+                        lead_id = None
+                        try:
+                            data = await resp.json()
+                            if isinstance(data, dict):
+                                lead_id = data.get("id") or (data.get("lead") or {}).get("id")
+                        except Exception:
+                            pass
+                        return True, lead_id
                     body = await resp.text()
                     logger.error("Не удалось создать лид в CRM: %s %s", resp.status, body)
-                    return False
+                    return False, None
         except Exception:
             logger.exception("Ошибка запроса к CRM")
-            return False
+            return False, None
+
+    async def get_recent_leads(self, limit: int = 50) -> list[dict]:
+        """Забирает список последних лидов из CRM (для фонового опроса).
+
+        Пробует несколько распространённых вариантов ответа API
+        (список напрямую, либо обёрнутый в "items"/"data"/"results"),
+        т.к. точный формат не задокументирован явно в этом проекте.
+        Если реальный формат отличается — смотрите {CRM_BASE_URL}/docs
+        и поправьте разбор ответа здесь.
+        """
+        url = f"{self.base_url}/leads"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    params={"limit": limit, "sort": "-created_at"},
+                    headers=self._headers(),
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.error("Не удалось получить список лидов из CRM: %s %s", resp.status, body)
+                        return []
+                    data = await resp.json()
+                    if isinstance(data, list):
+                        return data
+                    if isinstance(data, dict):
+                        for key in ("items", "data", "results", "leads"):
+                            if isinstance(data.get(key), list):
+                                return data[key]
+                    return []
+        except Exception:
+            logger.exception("Ошибка запроса списка лидов к CRM")
+            return []
 
 
 crm = CRMClient(CRM_BASE_URL, CRM_API_TOKEN)
+
+# ID лидов CRM, о которых менеджер уже уведомлён (заявки из бота попадают
+# сюда сразу при создании; заявки с сайта/других источников — фоновым
+# опросом poll_new_leads). Персистится в SEEN_LEADS_FILE, чтобы пережить
+# перезапуск бота без повторных/пропущенных уведомлений.
+notified_lead_ids: set[int] = set()
+
+
+def _load_seen_leads() -> None:
+    try:
+        if os.path.exists(SEEN_LEADS_FILE):
+            with open(SEEN_LEADS_FILE, "r", encoding="utf-8") as f:
+                notified_lead_ids.update(json.load(f))
+    except Exception:
+        logger.exception("Не удалось загрузить %s", SEEN_LEADS_FILE)
+
+
+def _save_seen_leads() -> None:
+    try:
+        with open(SEEN_LEADS_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(notified_lead_ids), f)
+    except Exception:
+        logger.exception("Не удалось сохранить %s", SEEN_LEADS_FILE)
+
+
+def _lead_notification_text(lead: dict) -> str:
+    name = lead.get("name") or "—"
+    phone = lead.get("phone") or "—"
+    source = lead.get("source") or "Не указан (скорее всего сайт)"
+    comment = lead.get("comment") or ""
+    client_type = lead.get("client_type")
+    client_type_label = "Юридическое лицо" if client_type == "юр" else "Физическое лицо" if client_type == "физ" else None
+
+    lines = [
+        "🆕 Пришла новая заявка в CRM!",
+        f"Источник: {source}",
+        f"Имя: {name}",
+        f"Телефон: {phone}",
+    ]
+    if client_type_label:
+        lines.append(f"Тип клиента: {client_type_label}")
+    if comment:
+        lines.append(comment)
+    return "\n".join(lines)
+
+
+async def poll_new_leads(bot: Bot) -> None:
+    """Фоновая задача: раз в CRM_POLL_INTERVAL секунд проверяет CRM на
+    новые заявки и шлёт уведомление менеджеру о ЛЮБОЙ заявке, которую
+    бот ещё не показывал — независимо от того, откуда она пришла
+    (сайт, бот, ручное добавление в CRM и т.д.).
+
+    Заявки, созданные самим ботом, уже уведомляются мгновенно в момент
+    создания (см. cleaning_name/_finish_call_order) и их id сразу
+    добавляется в notified_lead_ids — так что здесь они не дублируются.
+    """
+    if not MANAGER_CHAT_ID:
+        return
+
+    _load_seen_leads()
+    first_run = not notified_lead_ids
+
+    while True:
+        try:
+            leads = await crm.get_recent_leads(limit=50)
+            new_leads = []
+            for lead in leads:
+                lead_id = lead.get("id")
+                if lead_id is None or lead_id in notified_lead_ids:
+                    continue
+                new_leads.append(lead)
+
+            if first_run:
+                # При первом запуске не спамим менеджера историей — просто
+                # запоминаем всё, что уже есть в CRM, и уведомляем только
+                # о том, что появится после.
+                for lead in new_leads:
+                    if lead.get("id") is not None:
+                        notified_lead_ids.add(lead["id"])
+                _save_seen_leads()
+                first_run = False
+            else:
+                # Уведомляем в хронологическом порядке (старые -> новые).
+                for lead in reversed(new_leads):
+                    lead_id = lead.get("id")
+                    try:
+                        await bot.send_message(MANAGER_CHAT_ID, _lead_notification_text(lead))
+                    except Exception:
+                        logger.exception("Не удалось отправить уведомление менеджеру о лиде %s", lead_id)
+                        continue
+                    if lead_id is not None:
+                        notified_lead_ids.add(lead_id)
+                if new_leads:
+                    _save_seen_leads()
+        except Exception:
+            logger.exception("Ошибка в фоновом опросе CRM на новые заявки")
+
+        await asyncio.sleep(CRM_POLL_INTERVAL)
 
 
 # ============================== СОСТОЯНИЯ (FSM) =============================
@@ -408,7 +563,7 @@ async def cleaning_name(message: Message, state: FSMContext, bot: Bot):
         f"Адрес/район: {data.get('address')}"
     )
 
-    ok = await crm.create_lead(
+    ok, lead_id = await crm.create_lead(
         name=full_name,
         phone=data.get("phone", ""),
         source=SOURCE_CLEANING,
@@ -417,6 +572,8 @@ async def cleaning_name(message: Message, state: FSMContext, bot: Bot):
         client_type=client_type,
         comment=comment,
     )
+    if lead_id is not None:
+        notified_lead_ids.add(lead_id)
 
     await message.answer(
         "Спасибо! Ваша заявка принята. В ближайшее время с вами свяжется менеджер."
@@ -472,13 +629,15 @@ async def _finish_call_order(message: Message, state: FSMContext, bot: Bot, phon
     full_name = f"{data.get('name', '')} {data.get('surname', '')}".strip()
     username = f"@{message.from_user.username}" if message.from_user.username else None
 
-    ok = await crm.create_lead(
+    ok, lead_id = await crm.create_lead(
         name=full_name,
         phone=phone,
         source=SOURCE_CALL,
         pipeline_id=CRM_PIPELINE_ID,
         telegram=username,
     )
+    if lead_id is not None:
+        notified_lead_ids.add(lead_id)
 
     await message.answer(
         "Спасибо! Ваша заявка принята. В ближайшее время с вами свяжется менеджер.",
@@ -574,7 +733,14 @@ async def main():
     dp.include_router(router)
 
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+
+    # Фоновая задача: следит за CRM и уведомляет менеджера о ЛЮБОЙ новой
+    # заявке, откуда бы она ни пришла (сайт, бот, ручное добавление).
+    poll_task = asyncio.create_task(poll_new_leads(bot))
+    try:
+        await dp.start_polling(bot)
+    finally:
+        poll_task.cancel()
 
 
 if __name__ == "__main__":
