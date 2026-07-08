@@ -75,7 +75,7 @@ CRM_PIPELINE_ID = int(os.getenv("CRM_PIPELINE_ID", "1"))
 # Как часто (в секундах) бот опрашивает CRM в поисках новых заявок,
 # пришедших НЕ из бота (например с сайта). Это гарантирует, что менеджер
 # получит уведомление о любой заявке в CRM, независимо от источника.
-CRM_POLL_INTERVAL = int(os.getenv("CRM_POLL_INTERVAL", "20"))
+CRM_POLL_INTERVAL = int(os.getenv("CRM_POLL_INTERVAL", "10"))
 
 # Файл, в котором бот запоминает ID уже обработанных лидов CRM, чтобы
 # при перезапуске не разослать уведомления повторно и не пропустить новые.
@@ -172,7 +172,8 @@ class CRMClient:
                         try:
                             data = await resp.json()
                             if isinstance(data, dict):
-                                lead_id = data.get("id") or (data.get("lead") or {}).get("id")
+                                inner = data.get("lead") if isinstance(data.get("lead"), dict) else data
+                                lead_id = CRMClient.extract_lead_id(inner)
                         except Exception:
                             pass
                         return True, lead_id
@@ -186,36 +187,75 @@ class CRMClient:
     async def get_recent_leads(self, limit: int = 50) -> list[dict]:
         """Забирает список последних лидов из CRM (для фонового опроса).
 
-        Пробует несколько распространённых вариантов ответа API
-        (список напрямую, либо обёрнутый в "items"/"data"/"results"),
-        т.к. точный формат не задокументирован явно в этом проекте.
-        Если реальный формат отличается — смотрите {CRM_BASE_URL}/docs
-        и поправьте разбор ответа здесь.
+        Т.к. точный формат этого эндпоинта не задокументирован, пробуем
+        по очереди несколько распространённых вариантов запроса (без
+        параметров / с limit / с пагинацией) и несколько вариантов формы
+        ответа (голый список / обёрнутый в items-data-results-leads).
+        Первый успешный (status 200 + удалось найти список) — используем.
         """
         url = f"{self.base_url}/leads"
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url,
-                    params={"limit": limit, "sort": "-created_at"},
-                    headers=self._headers(),
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    if resp.status != 200:
-                        body = await resp.text()
-                        logger.error("Не удалось получить список лидов из CRM: %s %s", resp.status, body)
-                        return []
-                    data = await resp.json()
-                    if isinstance(data, list):
-                        return data
-                    if isinstance(data, dict):
-                        for key in ("items", "data", "results", "leads"):
-                            if isinstance(data.get(key), list):
-                                return data[key]
-                    return []
-        except Exception:
-            logger.exception("Ошибка запроса списка лидов к CRM")
-            return []
+        attempts = [
+            {},
+            {"limit": limit},
+            {"limit": limit, "sort": "-created_at"},
+            {"per_page": limit},
+            {"page_size": limit},
+        ]
+
+        for params in attempts:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        url,
+                        params=params or None,
+                        headers=self._headers(),
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        if resp.status != 200:
+                            continue
+                        try:
+                            data = await resp.json()
+                        except Exception:
+                            continue
+
+                        leads = None
+                        if isinstance(data, list):
+                            leads = data
+                        elif isinstance(data, dict):
+                            for key in ("items", "data", "results", "leads"):
+                                if isinstance(data.get(key), list):
+                                    leads = data[key]
+                                    break
+
+                        if leads is not None:
+                            if not CRMClient._logged_shape:
+                                logger.info(
+                                    "CRM GET /leads (params=%s) вернул %d записей. Пример первой записи: %s",
+                                    params,
+                                    len(leads),
+                                    json.dumps(leads[0], ensure_ascii=False) if leads else "пусто",
+                                )
+                                CRMClient._logged_shape = True
+                            return leads
+            except Exception:
+                logger.exception("Ошибка запроса списка лидов к CRM (params=%s)", params)
+                continue
+
+        logger.error(
+            "Не удалось получить список лидов ни одним из известных способов. "
+            "Откройте %s/docs и проверьте формат ответа GET /leads вручную.",
+            self.base_url,
+        )
+        return []
+
+    _logged_shape = False
+
+    @staticmethod
+    def extract_lead_id(lead: dict):
+        for key in ("id", "_id", "lead_id", "leadId", "uuid"):
+            if key in lead and lead[key] is not None:
+                return lead[key]
+        return None
 
 
 crm = CRMClient(CRM_BASE_URL, CRM_API_TOKEN)
@@ -286,31 +326,29 @@ async def poll_new_leads(bot: Bot) -> None:
             leads = await crm.get_recent_leads(limit=50)
             new_leads = []
             for lead in leads:
-                lead_id = lead.get("id")
+                lead_id = CRMClient.extract_lead_id(lead)
                 if lead_id is None or lead_id in notified_lead_ids:
                     continue
-                new_leads.append(lead)
+                new_leads.append((lead_id, lead))
 
             if first_run:
                 # При первом запуске не спамим менеджера историей — просто
                 # запоминаем всё, что уже есть в CRM, и уведомляем только
                 # о том, что появится после.
-                for lead in new_leads:
-                    if lead.get("id") is not None:
-                        notified_lead_ids.add(lead["id"])
+                for lead_id, _ in new_leads:
+                    notified_lead_ids.add(lead_id)
                 _save_seen_leads()
                 first_run = False
+                logger.info("Фоновый опрос CRM запущен, база: %d лидов.", len(notified_lead_ids))
             else:
                 # Уведомляем в хронологическом порядке (старые -> новые).
-                for lead in reversed(new_leads):
-                    lead_id = lead.get("id")
+                for lead_id, lead in reversed(new_leads):
                     try:
                         await bot.send_message(MANAGER_CHAT_ID, _lead_notification_text(lead))
                     except Exception:
                         logger.exception("Не удалось отправить уведомление менеджеру о лиде %s", lead_id)
                         continue
-                    if lead_id is not None:
-                        notified_lead_ids.add(lead_id)
+                    notified_lead_ids.add(lead_id)
                 if new_leads:
                     _save_seen_leads()
         except Exception:
